@@ -1,20 +1,19 @@
 'use strict';
 
 module.exports = {
-	updatePeersList: {
+	discover: {
 		peers: {
-			id: 'peer.updatePeersList.peers',
+			id: 'peers.discover.peers',
 			type: 'object',
 			properties: {
 				peers: {
-					type: 'array',
-					uniqueItems: true
+					type: 'array'
 				}
 			},
 			required: ['peers']
 		},
 		peer: {
-			id: 'peer.updatePeersList.peer',
+			id: 'peers.discover.peer',
 			type: 'object',
 			properties: {
 				ip: {
@@ -42,9 +41,17 @@ module.exports = {
 					format: 'version',
 					minLength: 5,
 					maxLength: 12
+				},
+				broadhash: {
+					type: 'string',
+					format: 'hex'
+				},
+				height: {
+					type: 'integer',
+					minimum: 1
 				}
 			},
-			required: ['ip', 'port', 'state']
+			required: ['ip', 'port']
 		}
 	},
 	getPeers: {
@@ -76,6 +83,14 @@ module.exports = {
 				format: 'version',
 				minLength: 5,
 				maxLength: 12
+			},
+			broadhash: {
+				type: 'string',
+				format: 'hex'
+			},
+			height: {
+				type: 'integer',
+				minimum: 1
 			},
 			orderBy: {
 				type: 'string'

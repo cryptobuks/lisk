@@ -1,14 +1,12 @@
 'use strict';
 
+var constants = require('../helpers/constants.js');
+
 module.exports = {
 	headers: {
 		id: 'transport.headers',
 		type: 'object',
 		properties: {
-			ip: {
-				type: 'string',
-				format: 'ip'
-			},
 			port: {
 				type: 'integer',
 				minimum: 1,
@@ -29,9 +27,22 @@ module.exports = {
 			nethash: {
 				type: 'string',
 				maxLength: 64
+			},
+			broadhash: {
+				type: 'string',
+				format: 'hex'
+			},
+			height: {
+				type: 'integer',
+				minimum: 1
+			},
+			nonce: {
+				type: 'string',
+				minimum: 16,
+				max: 16
 			}
 		},
-		required: ['ip', 'port', 'nethash', 'version']
+		required: ['port', 'version', 'nethash']
 	},
 	commonBlock: {
 		id: 'transport.commonBlock',
@@ -56,8 +67,32 @@ module.exports = {
 			}
 		},
 	},
+	transactions: {
+		id: 'transport.transactions',
+		type: 'object',
+		properties: {
+			transactions: {
+				type: 'array',
+				minItems: 1,
+				maxItems: 25
+			}
+		},
+		required: ['transactions']
+	},
 	signatures: {
 		id: 'transport.signatures',
+		type: 'object',
+		properties: {
+			signatures: {
+				type: 'array',
+				minItems: 1,
+				maxItems: 25
+			}
+		},
+		required: ['signatures']
+	},
+	signature: {
+		id: 'transport.signature',
 		type: 'object',
 		properties: {
 			signature: {

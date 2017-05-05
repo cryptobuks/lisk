@@ -1,25 +1,27 @@
 'use strict';
 
+var _ = require('lodash');
 var async = require('async');
-var ByteBuffer = require('bytebuffer');
 var constants = require('../helpers/constants.js');
 var crypto = require('crypto');
 var extend = require('extend');
-var genesisblock = null;
 var OrderBy = require('../helpers/orderBy.js');
-var Router = require('../helpers/router.js');
 var sandboxHelper = require('../helpers/sandbox.js');
 var schema = require('../schema/transactions.js');
-var slots = require('../helpers/slots.js');
 var sql = require('../sql/transactions.js');
+var TransactionPool = require('../logic/transactionPool.js');
 var transactionTypes = require('../helpers/transactionTypes.js');
+var Transfer = require('../logic/transfer.js');
 
 // Private fields
-var modules, library, self, __private = {}, shared = {};
+var __private = {};
+var shared = {};
+var genesisblock = null;
+var modules;
+var library;
+var self;
 
 __private.assetTypes = {};
-__private.unconfirmedTransactions = [];
-__private.unconfirmedTransactionsIdIndex = {};
 
 // Constructor
 function Transactions (cb, scope) {
@@ -27,9 +29,8 @@ function Transactions (cb, scope) {
 	genesisblock = library.genesisblock;
 	self = this;
 
-	__private.attachApi();
+	__private.transactionPool = new TransactionPool(library);
 
-	var Transfer = require('../logic/transfer.js');
 	__private.assetTypes[transactionTypes.SEND] = library.logic.transaction.attachAssetType(
 		transactionTypes.SEND, new Transfer()
 	);
@@ -38,67 +39,89 @@ function Transactions (cb, scope) {
 }
 
 // Private methods
-__private.attachApi = function () {
-	var router = new Router();
-
-	router.use(function (req, res, next) {
-		if (modules) { return next(); }
-		res.status(500).send({success: false, error: 'Blockchain is loading'});
-	});
-
-	router.map(shared, {
-		'get /': 'getTransactions',
-		'get /get': 'getTransaction',
-		'get /unconfirmed/get': 'getUnconfirmedTransaction',
-		'get /unconfirmed': 'getUnconfirmedTransactions',
-		'put /': 'addTransactions'
-	});
-
-	router.use(function (req, res, next) {
-		res.status(500).send({success: false, error: 'API endpoint not found'});
-	});
-
-	library.network.app.use('/api/transactions', router);
-	library.network.app.use(function (err, req, res, next) {
-		if (!err) { return next(); }
-		library.logger.error('API error ' + req.url, err);
-		res.status(500).send({success: false, error: 'API error: ' + err.message});
-	});
-};
-
 __private.list = function (filter, cb) {
-	var sortFields = sql.sortFields;
-	var params = {}, where = [], owner = '';
+	var params = {};
+	var where = [];
+	var allowedFieldsMap = {
+		blockId:             '"t_blockId" = ${blockId}',
+		senderPublicKey:     '"t_senderPublicKey" = DECODE (${senderPublicKey}, \'hex\')',
+		recipientPublicKey:  '"m_recipientPublicKey" = DECODE (${recipientPublicKey}, \'hex\')',
+		senderId:            '"t_senderId" = ${senderId}',
+		recipientId:         '"t_recipientId" = ${recipientId}',
+		fromHeight:          '"b_height" >= ${fromHeight}',
+		toHeight:            '"b_height" <= ${toHeight}',
+		fromTimestamp:       '"t_timestamp" >= ${fromTimestamp}',
+		toTimestamp:         '"t_timestamp" <= ${toTimestamp}',
+		senderIds:           '"t_senderId" IN (${senderIds:csv})',
+		recipientIds:        '"t_recipientId" IN (${recipientIds:csv})',
+		senderPublicKeys:    'ENCODE ("t_senderPublicKey", \'hex\') IN (${senderPublicKeys:csv})',
+		recipientPublicKeys: 'ENCODE ("m_recipientPublicKey", \'hex\') IN (${recipientPublicKeys:csv})',
+		minAmount:           '"t_amount" >= ${minAmount}',
+		maxAmount:           '"t_amount" <= ${maxAmount}',
+		type:                '"t_type" = ${type}',
+		minConfirmations:    'confirmations >= ${minConfirmations}',
+		limit: null,
+		offset: null,
+		orderBy: null,
+		// FIXME: Backward compatibility, should be removed after transitional period
+		ownerAddress: null,
+		ownerPublicKey: null
+	};
+	var owner = '';
+	var isFirstWhere = true;
 
-	if (filter.blockId) {
-		where.push('"t_blockId" = ${blockId}');
-		params.blockId = filter.blockId;
+	var processParams = function (value, key) {
+		var field = String(key).split(':');
+		if (field.length === 1) {
+			// Only field identifier, so using default 'OR' condition
+			field.unshift('OR');
+		} else if (field.length === 2) {
+			// Condition supplied, checking if correct one
+			if (_.includes(['or', 'and'], field[0].toLowerCase())) {
+				field[0] = field[0].toUpperCase();
+			} else {
+				throw new Error('Incorrect condition [' + field[0] + '] for field: ' + field[1]);
+			}
+		} else {
+			// Invalid parameter 'x:y:z'
+			throw new Error('Invalid parameter supplied: ' + key);
+		}
+
+		// Mutating parametres when unix timestamp is supplied
+		if (_.includes(['fromUnixTime', 'toUnixTime'], field[1])) {
+			// Lisk epoch is 1464109200 as unix timestamp
+			value = value - constants.epochTime.getTime() / 1000;
+			field[1] = field[1].replace('UnixTime', 'Timestamp');
+		}
+
+		if (!_.includes(_.keys(allowedFieldsMap), field[1])) {
+			throw new Error('Parameter is not supported: ' + field[1]);
+		}
+
+		// Checking for empty parameters, 0 is allowed for few
+		if (!value && !(value === 0 && _.includes(['fromTimestamp', 'minAmount', 'minConfirmations', 'type', 'offset'], field[1]))) {
+			throw new Error('Value for parameter [' + field[1] + '] cannot be empty');
+		}
+
+		if (allowedFieldsMap[field[1]]) {
+			where.push((!isFirstWhere ? (field[0] + ' ') : '') + allowedFieldsMap[field[1]]);
+			params[field[1]] = value;
+			isFirstWhere = false;
+		}
+	};
+
+	// Generate list of fields with conditions
+	try {
+		_.each(filter, processParams);
+	} catch (err) {
+		return setImmediate(cb, err.message);
 	}
 
-	if (filter.senderPublicKey) {
-		where.push('"t_senderPublicKey"::bytea = ${senderPublicKey}');
-		params.senderPublicKey = filter.senderPublicKey;
-	}
-
-	if (filter.senderId) {
-		where.push('"t_senderId" = ${senderId}');
-		params.senderId = filter.senderId;
-	}
-
-	if (filter.recipientId) {
-		where.push('"t_recipientId" = ${recipientId}');
-		params.recipientId = filter.recipientId;
-	}
-
+	// FIXME: Backward compatibility, should be removed after transitional period
 	if (filter.ownerAddress && filter.ownerPublicKey) {
-		owner = '("t_senderPublicKey"::bytea = ${ownerPublicKey} OR "t_recipientId" = ${ownerAddress})';
+		owner = '("t_senderPublicKey" = DECODE (${ownerPublicKey}, \'hex\') OR "t_recipientId" = ${ownerAddress})';
 		params.ownerPublicKey = filter.ownerPublicKey;
 		params.ownerAddress = filter.ownerAddress;
-	}
-
-	if (filter.type >= 0) {
-		where.push('"t_type" = ${type}');
-		params.type = filter.type;
 	}
 
 	if (!filter.limit) {
@@ -113,16 +136,18 @@ __private.list = function (filter, cb) {
 		params.offset = Math.abs(filter.offset);
 	}
 
-	if (params.limit > 100) {
-		return setImmediate(cb, 'Invalid limit. Maximum is 100');
+	if (params.limit > 1000) {
+		return setImmediate(cb, 'Invalid limit, maximum is 1000');
 	}
 
 	var orderBy = OrderBy(
 		filter.orderBy, {
 			sortFields: sql.sortFields,
 			fieldPrefix: function (sortField) {
-				if (['height', 'blockId', 'confirmations'].indexOf(sortField) > -1) {
+				if (['height'].indexOf(sortField) > -1) {
 					return 'b_' + sortField;
+				} else if (['confirmations'].indexOf(sortField) > -1) {
+					return sortField;
 				} else {
 					return 't_' + sortField;
 				}
@@ -183,188 +208,125 @@ __private.getById = function (id, cb) {
 	});
 };
 
-__private.addUnconfirmedTransaction = function (transaction, sender, cb) {
-	self.applyUnconfirmed(transaction, sender, function (err) {
-		if (err) {
-			self.removeUnconfirmedTransaction(transaction.id);
-			return setImmediate(cb, err);
-		} else {
-			transaction.receivedAt = new Date();
-			__private.unconfirmedTransactions.push(transaction);
-			var index = __private.unconfirmedTransactions.length - 1;
-			__private.unconfirmedTransactionsIdIndex[transaction.id] = index;
-
-			return setImmediate(cb);
+__private.getVotesById = function (transaction, cb) {
+	library.db.query(sql.getVotesById, {id: transaction.id}).then(function (rows) {
+		if (!rows.length) {
+			return setImmediate(cb, 'Transaction not found: ' + transaction.id);
 		}
+
+		var votes = rows[0].votes.split(',');
+		var added = [];
+		var deleted = [];
+
+		for (var i = 0; i < votes.length; i++) {
+			if (votes[i].substring(0, 1) === '+') {
+				added.push (votes[i].substring(1));
+			} else if (votes[i].substring(0, 1) === '-') {
+				deleted.push (votes[i].substring(1));
+			}
+		}
+
+		transaction.votes = {added: added, deleted: deleted};
+
+		return setImmediate(cb, null, transaction);
+	}).catch(function (err) {
+		library.logger.error(err.stack);
+		return setImmediate(cb, 'Transactions#getVotesById error');
+	});
+};
+
+__private.getPooledTransaction = function (method, req, cb) {
+	library.schema.validate(req.body, schema.getPooledTransaction, function (err) {
+		if (err) {
+			return setImmediate(cb, err[0].message);
+		}
+
+		var transaction = self[method](req.body.id);
+
+		if (!transaction) {
+			return setImmediate(cb, 'Transaction not found');
+		}
+
+		return setImmediate(cb, null, {transaction: transaction});
+	});
+};
+
+__private.getPooledTransactions = function (method, req, cb) {
+	library.schema.validate(req.body, schema.getPooledTransactions, function (err) {
+		if (err) {
+			return setImmediate(cb, err[0].message);
+		}
+
+		var transactions = self[method](true);
+		var i, toSend = [];
+
+		if (req.body.senderPublicKey || req.body.address) {
+			for (i = 0; i < transactions.length; i++) {
+				if (transactions[i].senderPublicKey === req.body.senderPublicKey || transactions[i].recipientId === req.body.address) {
+					toSend.push(transactions[i]);
+				}
+			}
+		} else {
+			for (i = 0; i < transactions.length; i++) {
+				toSend.push(transactions[i]);
+			}
+		}
+
+		return setImmediate(cb, null, {transactions: toSend, count: transactions.length});
 	});
 };
 
 // Public methods
+Transactions.prototype.transactionInPool = function (id) {
+	return __private.transactionPool.transactionInPool(id);
+};
+
 Transactions.prototype.getUnconfirmedTransaction = function (id) {
-	var index = __private.unconfirmedTransactionsIdIndex[id];
-	return __private.unconfirmedTransactions[index];
+	return __private.transactionPool.getUnconfirmedTransaction(id);
+};
+
+Transactions.prototype.getQueuedTransaction = function (id) {
+	return __private.transactionPool.getQueuedTransaction(id);
+};
+
+Transactions.prototype.getMultisignatureTransaction = function (id) {
+	return __private.transactionPool.getMultisignatureTransaction(id);
 };
 
 Transactions.prototype.getUnconfirmedTransactionList = function (reverse, limit) {
-	var a = [];
+	return __private.transactionPool.getUnconfirmedTransactionList(reverse, limit);
+};
 
-	for (var i = 0; i < __private.unconfirmedTransactions.length; i++) {
-		if (__private.unconfirmedTransactions[i] !== false) {
-			a.push(__private.unconfirmedTransactions[i]);
-		}
-	}
+Transactions.prototype.getQueuedTransactionList = function (reverse, limit) {
+	return __private.transactionPool.getQueuedTransactionList(reverse, limit);
+};
 
-	a = reverse ? a.reverse() : a;
+Transactions.prototype.getMultisignatureTransactionList = function (reverse, limit) {
+	return __private.transactionPool.getMultisignatureTransactionList(reverse, limit);
+};
 
-	if (limit) {
-		a.splice(limit);
-	}
-
-	return a;
+Transactions.prototype.getMergedTransactionList = function (reverse, limit) {
+	return __private.transactionPool.getMergedTransactionList(reverse, limit);
 };
 
 Transactions.prototype.removeUnconfirmedTransaction = function (id) {
-	var index = __private.unconfirmedTransactionsIdIndex[id];
-	delete __private.unconfirmedTransactionsIdIndex[id];
-	__private.unconfirmedTransactions[index] = false;
+	return __private.transactionPool.removeUnconfirmedTransaction(id);
 };
 
 Transactions.prototype.processUnconfirmedTransaction = function (transaction, broadcast, cb) {
-	// Check transaction
-	if (!transaction) {
-		return setImmediate(cb, 'Missing transaction');
-	}
-
-	// Ignore transaction when syncing
-	if (modules.loader.syncing()) {
-		return setImmediate(cb);
-	}
-
-	// Check transaction indexes
-	if (__private.unconfirmedTransactionsIdIndex[transaction.id] !== undefined) {
-		library.logger.debug('Transaction is already processed: ' + transaction.id);
-		return setImmediate(cb);
-	}
-
-	modules.accounts.setAccountAndGet({publicKey: transaction.senderPublicKey}, function (err, sender) {
-		function done (err, ignore) {
-			if (err) {
-				if (ignore) {
-					library.logger.debug(err);
-					return setImmediate(cb);
-				} else {
-					return setImmediate(cb, err);
-				}
-			}
-
-			__private.addUnconfirmedTransaction(transaction, sender, function (err) {
-				if (err) {
-					return setImmediate(cb, err);
-				}
-
-				library.bus.message('unconfirmedTransaction', transaction, broadcast);
-
-				return setImmediate(cb);
-			});
-		}
-
-		if (err) {
-			return done(err);
-		}
-
-		if (transaction.requesterPublicKey && sender && Array.isArray(sender.multisignatures) && sender.multisignatures.length) {
-			modules.accounts.getAccount({publicKey: transaction.requesterPublicKey}, function (err, requester) {
-				if (err) {
-					return done(err);
-				}
-
-				if (!requester) {
-					return done('Requester not found');
-				}
-
-				library.logic.transaction.process(transaction, sender, requester, function (err, transaction, ignore) {
-					if (err) {
-						return done(err, ignore);
-					}
-
-					library.logic.transaction.verify(transaction, sender, done);
-				});
-			});
-		} else {
-			library.logic.transaction.process(transaction, sender, function (err, transaction, ignore) {
-				if (err) {
-					return done(err, ignore);
-				}
-
-				library.logic.transaction.verify(transaction, sender, done);
-			});
-		}
-	});
+	return __private.transactionPool.processUnconfirmedTransaction(transaction, broadcast, cb);
 };
 
-Transactions.prototype.applyUnconfirmedList = function (ids, cb) {
-	async.eachSeries(ids, function (id, cb) {
-		var transaction = self.getUnconfirmedTransaction(id);
-		modules.accounts.setAccountAndGet({publicKey: transaction.senderPublicKey}, function (err, sender) {
-			if (err) {
-				self.removeUnconfirmedTransaction(id);
-				return setImmediate(cb, err);
-			}
-			self.applyUnconfirmed(transaction, sender, function (err) {
-				if (err) {
-					self.removeUnconfirmedTransaction(id);
-				}
-				return setImmediate(cb, err);
-			});
-		});
-	}, cb);
+Transactions.prototype.applyUnconfirmedList = function (cb) {
+	return __private.transactionPool.applyUnconfirmedList(cb);
+};
+
+Transactions.prototype.applyUnconfirmedIds = function (ids, cb) {
+	return __private.transactionPool.applyUnconfirmedIds(ids, cb);
 };
 
 Transactions.prototype.undoUnconfirmedList = function (cb) {
-	var ids = [];
-
-	async.eachSeries(__private.unconfirmedTransactions, function (transaction, cb) {
-		if (transaction !== false) {
-			ids.push(transaction.id);
-			self.undoUnconfirmed(transaction, cb);
-		} else {
-			return setImmediate(cb);
-		}
-	}, function (err) {
-		return setImmediate(cb, err, ids);
-	});
-};
-
-Transactions.prototype.expireUnconfirmedList = function (cb) {
-	var standardTimeOut = Number(constants.unconfirmedTransactionTimeOut);
-	var ids = [];
-
-	async.eachSeries(__private.unconfirmedTransactions, function (transaction, cb) {
-		if (transaction === false) {
-			return setImmediate(cb);
-		}
-
-		var timeNow = new Date();
-		var timeOut = (transaction.type === 4) ? (transaction.asset.multisignature.lifetime * 3600) : standardTimeOut;
-		var seconds = Math.floor((timeNow.getTime() - transaction.receivedAt.getTime()) / 1000);
-
-		if (seconds > timeOut) {
-			self.undoUnconfirmed(transaction, function (err) {
-				if (err) {
-					return setImmediate(cb, err);
-				} else {
-					ids.push(transaction.id);
-					self.removeUnconfirmedTransaction(transaction.id);
-					library.logger.info('Expired unconfirmed transaction: ' + transaction.id + ' received at: ' + transaction.receivedAt.toUTCString());
-					return setImmediate(cb);
-				}
-			});
-		} else {
-			return setImmediate(cb);
-		}
-	}, function (err) {
-		return setImmediate(cb, err, ids);
-	});
+	return __private.transactionPool.undoUnconfirmedList(cb);
 };
 
 Transactions.prototype.apply = function (transaction, block, sender, cb) {
@@ -412,179 +374,239 @@ Transactions.prototype.undoUnconfirmed = function (transaction, cb) {
 	});
 };
 
-Transactions.prototype.receiveTransactions = function (transactions, cb) {
-	async.eachSeries(transactions, function (transaction, cb) {
-		self.processUnconfirmedTransaction(transaction, true, cb);
-	}, function (err) {
-		return setImmediate(cb, err, transactions);
-	});
+Transactions.prototype.receiveTransactions = function (transactions, broadcast, cb) {
+	return __private.transactionPool.receiveTransactions(transactions, broadcast, cb);
+};
+
+Transactions.prototype.fillPool = function (cb) {
+	return __private.transactionPool.fillPool(cb);
 };
 
 Transactions.prototype.sandboxApi = function (call, args, cb) {
 	sandboxHelper.callMethod(shared, call, args, cb);
 };
 
+Transactions.prototype.isLoaded = function () {
+	return !!modules;
+};
+
 // Events
 Transactions.prototype.onBind = function (scope) {
 	modules = scope;
 
+	__private.transactionPool.bind(modules);
 	__private.assetTypes[transactionTypes.SEND].bind({
 		modules: modules, library: library
 	});
 };
 
-Transactions.prototype.onPeersReady = function () {
-	setImmediate(function nextUnconfirmedExpiry () {
-		self.expireUnconfirmedList(function (err, ids) {
+// Shared API
+Transactions.prototype.shared = {
+	getTransactions: function (req, cb) {
+		async.waterfall([
+			function (waterCb) {
+				var params = {};
+				var pattern = /(and|or){1}:/i;
+
+				// Filter out 'and:'/'or:' from params to perform schema validation
+				_.each(req.body, function (value, key) {
+					var param = String(key).replace(pattern, '');
+					// Dealing with array-like parameters (csv comma separated)
+					if (_.includes(['senderIds', 'recipientIds', 'senderPublicKeys', 'recipientPublicKeys'], param)) {
+						value = String(value).split(',');
+						req.body[key] = value;
+					}
+					params[param] = value;
+				});
+
+				library.schema.validate(params, schema.getTransactions, function (err) {
+					if (err) {
+						return setImmediate(waterCb, err[0].message);
+					} else {
+						return setImmediate(waterCb, null);
+					}
+				});
+			},
+			function (waterCb) {
+				__private.list(req.body, function (err, data) {
+					if (err) {
+						return setImmediate(waterCb, 'Failed to get transactions: ' + err);
+					} else {
+						return setImmediate(waterCb, null, {transactions: data.transactions, count: data.count});
+					}
+				});
+			}
+		], function (err, res) {
+			return setImmediate(cb, err, res);
+		});
+	},
+
+	getTransaction: function (req, cb) {
+		library.schema.validate(req.body, schema.getTransaction, function (err) {
 			if (err) {
-				library.logger.error('Unconfirmed transactions timer:', err);
+				return setImmediate(cb, err[0].message);
 			}
 
-			setTimeout(nextUnconfirmedExpiry, 14 * 1000);
+			__private.getById(req.body.id, function (err, transaction) {
+				if (!transaction || err) {
+					return setImmediate(cb, 'Transaction not found');
+				}
+
+				if (transaction.type === 3) {
+					__private.getVotesById(transaction, function (err, transaction) {
+						return setImmediate(cb, null, {transaction: transaction});
+					});
+				} else {
+					return setImmediate(cb, null, {transaction: transaction});
+				}
+			});
 		});
-	});
-};
+	},
 
-// Shared
-shared.getTransactions = function (req, cb) {
-	library.schema.validate(req.body, schema.getTransactions, function (err) {
-		if (err) {
-			return setImmediate(cb, err[0].message);
-		}
+	getTransactionsCount: function (req, cb) {
+		library.db.query(sql.count).then(function (transactionsCount) {
+			return setImmediate(cb, null, {
+				confirmed: transactionsCount[0].count,
+				multisignature: __private.transactionPool.multisignature.transactions.length,
+				unconfirmed: __private.transactionPool.unconfirmed.transactions.length,
+				queued: __private.transactionPool.queued.transactions.length
+			});
+		}, function (err) {
+			return setImmediate(cb, 'Unable to count transactions');
+		});
+	},
 
-		__private.list(req.body, function (err, data) {
+	getQueuedTransaction: function (req, cb) {
+		return __private.getPooledTransaction('getQueuedTransaction', req, cb);
+	},
+
+	getQueuedTransactions: function (req, cb) {
+		return __private.getPooledTransactions('getQueuedTransactionList', req, cb);
+	},
+
+	getMultisignatureTransaction: function (req, cb) {
+		return __private.getPooledTransaction('getMultisignatureTransaction', req, cb);
+	},
+
+	getMultisignatureTransactions: function (req, cb) {
+		return __private.getPooledTransactions('getMultisignatureTransactionList', req, cb);
+	},
+
+	getUnconfirmedTransaction: function (req, cb) {
+		return __private.getPooledTransaction('getUnconfirmedTransaction', req, cb);
+	},
+
+	getUnconfirmedTransactions: function (req, cb) {
+		return __private.getPooledTransactions('getUnconfirmedTransactionList', req, cb);
+	},
+
+	addTransactions: function (req, cb) {
+		library.schema.validate(req.body, schema.addTransactions, function (err) {
 			if (err) {
-				return setImmediate(cb, 'Failed to get transactions: ' + err);
+				return setImmediate(cb, err[0].message);
 			}
 
-			return setImmediate(cb, null, {transactions: data.transactions, count: data.count});
-		});
-	});
-};
+			var hash = crypto.createHash('sha256').update(req.body.secret, 'utf8').digest();
+			var keypair = library.ed.makeKeypair(hash);
 
-shared.getTransaction = function (req, cb) {
-	library.schema.validate(req.body, schema.getTransaction, function (err) {
-		if (err) {
-			return setImmediate(cb, err[0].message);
-		}
-
-		__private.getById(req.body.id, function (err, transaction) {
-			if (!transaction || err) {
-				return setImmediate(cb, 'Transaction not found');
-			}
-			return setImmediate(cb, null, {transaction: transaction});
-		});
-	});
-};
-
-shared.getUnconfirmedTransaction = function (req, cb) {
-	library.schema.validate(req.body, schema.getUnconfirmedTransaction, function (err) {
-		if (err) {
-			return setImmediate(cb, err[0].message);
-		}
-
-		var unconfirmedTransaction = self.getUnconfirmedTransaction(req.body.id);
-
-		if (!unconfirmedTransaction) {
-			return setImmediate(cb, 'Transaction not found');
-		}
-
-		return setImmediate(cb, null, {transaction: unconfirmedTransaction});
-	});
-};
-
-shared.getUnconfirmedTransactions = function (req, cb) {
-	library.schema.validate(req.body, schema.getUnconfirmedTransactions, function (err) {
-		if (err) {
-			return setImmediate(cb, err[0].message);
-		}
-
-		var transactions = self.getUnconfirmedTransactionList(true);
-		var i, toSend = [];
-
-		if (req.body.senderPublicKey || req.body.address) {
-			for (i = 0; i < transactions.length; i++) {
-				if (transactions[i].senderPublicKey === req.body.senderPublicKey || transactions[i].recipientId === req.body.address) {
-					toSend.push(transactions[i]);
+			if (req.body.publicKey) {
+				if (keypair.publicKey.toString('hex') !== req.body.publicKey) {
+					return setImmediate(cb, 'Invalid passphrase');
 				}
 			}
-		} else {
-			for (i = 0; i < transactions.length; i++) {
-				toSend.push(transactions[i]);
-			}
-		}
 
-		return setImmediate(cb, null, {transactions: toSend});
-	});
-};
+			var query = {address: req.body.recipientId};
 
-shared.addTransactions = function (req, cb) {
-	library.schema.validate(req.body, schema.addTransactions, function (err) {
-		if (err) {
-			return setImmediate(cb, err[0].message);
-		}
+			library.balancesSequence.add(function (cb) {
+				modules.accounts.getAccount(query, function (err, recipient) {
+					if (err) {
+						return setImmediate(cb, err);
+					}
 
-		var hash = crypto.createHash('sha256').update(req.body.secret, 'utf8').digest();
-		var keypair = library.ed.makeKeypair(hash);
+					var recipientId = recipient ? recipient.address : req.body.recipientId;
 
-		if (req.body.publicKey) {
-			if (keypair.publicKey.toString('hex') !== req.body.publicKey) {
-				return setImmediate(cb, 'Invalid passphrase');
-			}
-		}
+					if (!recipientId) {
+						return setImmediate(cb, 'Invalid recipient');
+					}
 
-		var query = { address: req.body.recipientId };
-
-		library.balancesSequence.add(function (cb) {
-			modules.accounts.getAccount(query, function (err, recipient) {
-				if (err) {
-					return setImmediate(cb, err);
-				}
-
-				var recipientId = recipient ? recipient.address : req.body.recipientId;
-
-				if (!recipientId) {
-					return setImmediate(cb, 'Invalid recipient');
-				}
-
-				if (req.body.multisigAccountPublicKey && req.body.multisigAccountPublicKey !== keypair.publicKey.toString('hex')) {
-					modules.accounts.getAccount({publicKey: req.body.multisigAccountPublicKey}, function (err, account) {
-						if (err) {
-							return setImmediate(cb, err);
-						}
-
-						if (!account || !account.publicKey) {
-							return setImmediate(cb, 'Multisignature account not found');
-						}
-
-						if (!account.multisignatures || !account.multisignatures) {
-							return setImmediate(cb, 'Account does not have multisignatures enabled');
-						}
-
-						if (account.multisignatures.indexOf(keypair.publicKey.toString('hex')) < 0) {
-							return setImmediate(cb, 'Account does not belong to multisignature group');
-						}
-
-						modules.accounts.getAccount({publicKey: keypair.publicKey}, function (err, requester) {
+					if (req.body.multisigAccountPublicKey && req.body.multisigAccountPublicKey !== keypair.publicKey.toString('hex')) {
+						modules.accounts.getAccount({publicKey: req.body.multisigAccountPublicKey}, function (err, account) {
 							if (err) {
 								return setImmediate(cb, err);
 							}
 
-							if (!requester || !requester.publicKey) {
-								return setImmediate(cb, 'Requester not found');
+							if (!account || !account.publicKey) {
+								return setImmediate(cb, 'Multisignature account not found');
 							}
 
-							if (requester.secondSignature && !req.body.secondSecret) {
-								return setImmediate(cb, 'Missing requester second passphrase');
+							if (!Array.isArray(account.multisignatures)) {
+								return setImmediate(cb, 'Account does not have multisignatures enabled');
 							}
 
-							if (requester.publicKey === account.publicKey) {
-								return setImmediate(cb, 'Invalid requester public key');
+							if (account.multisignatures.indexOf(keypair.publicKey.toString('hex')) < 0) {
+								return setImmediate(cb, 'Account does not belong to multisignature group');
+							}
+
+							modules.accounts.getAccount({publicKey: keypair.publicKey}, function (err, requester) {
+								if (err) {
+									return setImmediate(cb, err);
+								}
+
+								if (!requester || !requester.publicKey) {
+									return setImmediate(cb, 'Requester not found');
+								}
+
+								if (requester.secondSignature && !req.body.secondSecret) {
+									return setImmediate(cb, 'Missing requester second passphrase');
+								}
+
+								if (requester.publicKey === account.publicKey) {
+									return setImmediate(cb, 'Invalid requester public key');
+								}
+
+								var secondKeypair = null;
+
+								if (requester.secondSignature) {
+									var secondHash = crypto.createHash('sha256').update(req.body.secondSecret, 'utf8').digest();
+									secondKeypair = library.ed.makeKeypair(secondHash);
+								}
+
+								var transaction;
+
+								try {
+									transaction = library.logic.transaction.create({
+										type: transactionTypes.SEND,
+										amount: req.body.amount,
+										sender: account,
+										recipientId: recipientId,
+										keypair: keypair,
+										requester: keypair,
+										secondKeypair: secondKeypair
+									});
+								} catch (e) {
+									return setImmediate(cb, e.toString());
+								}
+
+								modules.transactions.receiveTransactions([transaction], true, cb);
+							});
+						});
+					} else {
+						modules.accounts.setAccountAndGet({publicKey: keypair.publicKey.toString('hex')}, function (err, account) {
+							if (err) {
+								return setImmediate(cb, err);
+							}
+
+							if (!account || !account.publicKey) {
+								return setImmediate(cb, 'Account not found');
+							}
+
+							if (account.secondSignature && !req.body.secondSecret) {
+								return setImmediate(cb, 'Missing second passphrase');
 							}
 
 							var secondKeypair = null;
 
-							if (requester.secondSignature) {
+							if (account.secondSignature) {
 								var secondHash = crypto.createHash('sha256').update(req.body.secondSecret, 'utf8').digest();
 								secondKeypair = library.ed.makeKeypair(secondHash);
 							}
@@ -598,64 +620,25 @@ shared.addTransactions = function (req, cb) {
 									sender: account,
 									recipientId: recipientId,
 									keypair: keypair,
-									requester: keypair,
 									secondKeypair: secondKeypair
 								});
 							} catch (e) {
 								return setImmediate(cb, e.toString());
 							}
 
-							modules.transactions.receiveTransactions([transaction], cb);
+							modules.transactions.receiveTransactions([transaction], true, cb);
 						});
-					});
-				} else {
-					modules.accounts.setAccountAndGet({publicKey: keypair.publicKey.toString('hex')}, function (err, account) {
-						if (err) {
-							return setImmediate(cb, err);
-						}
-
-						if (!account || !account.publicKey) {
-							return setImmediate(cb, 'Account not found');
-						}
-
-						if (account.secondSignature && !req.body.secondSecret) {
-							return setImmediate(cb, 'Missing second passphrase');
-						}
-
-						var secondKeypair = null;
-
-						if (account.secondSignature) {
-							var secondHash = crypto.createHash('sha256').update(req.body.secondSecret, 'utf8').digest();
-							secondKeypair = library.ed.makeKeypair(secondHash);
-						}
-
-						var transaction;
-
-						try {
-							transaction = library.logic.transaction.create({
-								type: transactionTypes.SEND,
-								amount: req.body.amount,
-								sender: account,
-								recipientId: recipientId,
-								keypair: keypair,
-								secondKeypair: secondKeypair
-							});
-						} catch (e) {
-							return setImmediate(cb, e.toString());
-						}
-
-						modules.transactions.receiveTransactions([transaction], cb);
-					});
+					}
+				});
+			}, function (err, transaction) {
+				if (err) {
+					return setImmediate(cb, err);
 				}
-			});
-		}, function (err, transaction) {
-			if (err) {
-				return setImmediate(cb, err);
-			}
 
-			return setImmediate(cb, null, {transactionId: transaction[0].id});
+				return setImmediate(cb, null, {transactionId: transaction[0].id});
+			});
 		});
-	});
+	}
 };
 
 // Export

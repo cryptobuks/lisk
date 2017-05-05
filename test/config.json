@@ -1,7 +1,8 @@
 {
     "port": 4000,
     "address": "0.0.0.0",
-    "version": "0.0.0",
+    "version": "0.0.0a",
+    "minVersion": "0.0.0a",
     "fileLogLevel": "info",
     "logFileName": "logs/lisk.log",
     "consoleLogLevel": "debug",
@@ -11,9 +12,9 @@
         "host": "localhost",
         "port": 5432,
         "database": "lisk_test",
-        "user": null,
+        "user": "",
         "password": "password",
-        "poolSize": 20,
+        "poolSize": 95,
         "poolIdleTimeout": 30000,
         "reapIntervalMillis": 1000,
         "logEvents": [
@@ -21,8 +22,10 @@
         ]
     },
     "api": {
+        "enabled": true,
         "access": {
-            "whiteList": []
+            "public": true,
+            "whiteList": ["127.0.0.1"]
         },
         "options": {
             "limits": {
@@ -34,8 +37,11 @@
         }
     },
     "peers": {
+	"enabled": true,
         "list": [],
-        "blackList": [],
+        "access": {
+            "blackList": []
+        },
         "options": {
             "limits": {
                 "max": 0,
@@ -43,9 +49,18 @@
                 "delayAfter": 0,
                 "windowMs": 60000
             },
-            "maxUpdatePeers": 20,
             "timeout": 5000
         }
+    },
+    "broadcasts": {
+        "broadcastInterval": 5000,
+        "broadcastLimit": 20,
+        "parallelLimit": 20,
+        "releaseLimit": 25,
+        "relayLimit": 2
+    },
+    "transactions": {
+        "maxTxsPerQueue": 1000
     },
     "forging": {
         "force": true,

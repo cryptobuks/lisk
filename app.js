@@ -1,16 +1,18 @@
 'use strict';
 
-var appConfig = require('./config.json');
 var async = require('async');
 var checkIpInList = require('./helpers/checkIpInList.js');
 var extend = require('extend');
 var fs = require('fs');
+
 var genesisblock = require('./genesisBlock.json');
+var git = require('./helpers/git.js');
 var https = require('https');
 var Logger = require('./logger.js');
 var packageJson = require('./package.json');
 var path = require('path');
 var program = require('commander');
+var httpApi = require('./helpers/httpApi.js');
 var Sequence = require('./helpers/sequence.js');
 var util = require('util');
 var z_schema = require('./helpers/z_schema.js');
@@ -18,6 +20,16 @@ var z_schema = require('./helpers/z_schema.js');
 process.stdin.resume();
 
 var versionBuild = fs.readFileSync(path.join(__dirname, 'build'), 'utf8');
+
+/**
+ * Hash of last git commit
+ *
+ * @private
+ * @property lastCommit
+ * @type {String}
+ * @default ''
+ */
+var lastCommit = '';
 
 if (typeof gc !== 'undefined') {
 	setInterval(function () {
@@ -35,9 +47,7 @@ program
 	.option('-s, --snapshot <round>', 'verify snapshot')
 	.parse(process.argv);
 
-if (program.config) {
-	appConfig = require(path.resolve(process.cwd(), program.config));
-}
+var appConfig = require('./helpers/config.js')(program.config);
 
 if (program.port) {
 	appConfig.port = program.port;
@@ -71,8 +81,12 @@ if (program.snapshot) {
 	);
 }
 
+if (process.env.NODE_ENV === 'test') {
+	appConfig.coverage = true;
+}
+
 // Define top endpoint availability
-process.env.TOP =  appConfig.topAccounts;
+process.env.TOP = appConfig.topAccounts;
 
 var config = {
 	db: appConfig.db,
@@ -92,10 +106,30 @@ var config = {
 		dapps: './modules/dapps.js',
 		crypto: './modules/crypto.js',
 		sql: './modules/sql.js'
+	},
+	api: {
+		accounts: { http: './api/http/accounts.js' },
+		blocks: { http: './api/http/blocks.js' },
+		dapps: { http: './api/http/dapps.js' },
+		delegates: { http: './api/http/delegates.js' },
+		loader: { http: './api/http/loader.js' },
+		multisignatures: { http: './api/http/multisignatures.js' },
+		peers: { http: './api/http/peers.js' },
+		server: { http: './api/http/server.js' },
+		signatures: { http: './api/http/signatures.js' },
+		transactions: { http: './api/http/transactions.js' },
+		transport: { http: './api/http/transport.js' }
 	}
 };
 
 var logger = new Logger({ echo: appConfig.consoleLogLevel, errorLevel: appConfig.fileLogLevel, filename: appConfig.logFileName });
+
+// Trying to get last git commit
+try {
+	lastCommit = git.getLastCommit();
+} catch (err) {
+	logger.debug('Cannot get last git commit', err.message);
+}
 
 var d = require('domain').create();
 
@@ -128,9 +162,9 @@ d.run(function () {
 					delete appConfig.loading.snapshot;
 				}
 
-				fs.writeFile('./config.json', JSON.stringify(appConfig, null, 4), 'utf8', function (err) {
-					cb(err, appConfig);
-				});
+				fs.writeFileSync('./config.json', JSON.stringify(appConfig, null, 4));
+
+				cb(null, appConfig);
 			} else {
 				cb(null, appConfig);
 			}
@@ -142,6 +176,20 @@ d.run(function () {
 
 		build: function (cb) {
 			cb(null, versionBuild);
+		},
+		/**
+		 * Returns hash of last git commit
+		 *
+		 * @property lastCommit
+		 * @type {Function}
+		 * @async
+		 * @param  {Function} cb Callback function
+		 * @return {Function} cb Callback function from params
+		 * @return {Object}   cb.err Always return `null` here
+		 * @return {String}   cb.lastCommit Hash of last git commit
+		 */
+		lastCommit: function (cb) {
+			cb(null, lastCommit);
 		},
 
 		genesisblock: function (cb) {
@@ -164,9 +212,16 @@ d.run(function () {
 			var cors = require('cors');
 			var app = express();
 
+			if (appConfig.coverage) {
+				var im = require('istanbul-middleware');
+				logger.debug('Hook loader for coverage - do not use in production environment!');
+				im.hookLoader(__dirname);
+				app.use('/coverage', im.createHandler());
+			}
+
 			require('./helpers/request-limiter')(app, appConfig);
 
-			app.use(compression({ level: 6 }));
+			app.use(compression({ level: 9 }));
 			app.use(cors());
 			app.options('*', cors());
 
@@ -229,9 +284,10 @@ d.run(function () {
 			var path = require('path');
 			var bodyParser = require('body-parser');
 			var methodOverride = require('method-override');
-			var requestSanitizer = require('./helpers/request-sanitizer');
 			var queryParser = require('express-query-int');
+			var randomString = require('randomstring');
 
+			scope.nonce = randomString.generate(16);
 			scope.network.app.engine('html', require('ejs').renderFile);
 			scope.network.app.use(require('express-domain-middleware'));
 			scope.network.app.set('view engine', 'ejs');
@@ -250,77 +306,40 @@ d.run(function () {
 						return value;
 					}
 
-					/*jslint eqeq: true*/
-					if (isNaN(value) || parseInt(value) != value || isNaN(parseInt(value, radix))) {
+					// Ignore conditional fields for transactions list
+					if (/^.+?:(blockId|recipientId|senderId)$/.test(name)) {
 						return value;
 					}
 
+					/*eslint-disable eqeqeq */
+					if (isNaN(value) || parseInt(value) != value || isNaN(parseInt(value, radix))) {
+						return value;
+					}
+					/*eslint-enable eqeqeq */
 					return parseInt(value);
 				}
 			}));
 
 			scope.network.app.use(require('./helpers/z_schema-express.js')(scope.schema));
 
-			scope.network.app.use(function (req, res, next) {
-				var parts = req.url.split('/');
-				var ip = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+			scope.network.app.use(httpApi.middleware.logClientConnections.bind(null, scope.logger));
 
-				// Log client connections
-				logger.log(req.method + ' ' + req.url + ' from ' + ip);
+			/* Instruct browser to deny display of <frame>, <iframe> regardless of origin.
+			 *
+			 * RFC -> https://tools.ietf.org/html/rfc7034
+			 */
+			scope.network.app.use(httpApi.middleware.attachResponseHeader.bind(null, 'X-Frame-Options', 'DENY'));
+			/* Set Content-Security-Policy headers.
+			 *
+			 * frame-ancestors - Defines valid sources for <frame>, <iframe>, <object>, <embed> or <applet>.
+			 *
+			 * W3C Candidate Recommendation -> https://www.w3.org/TR/CSP/
+			 */
+			scope.network.app.use(httpApi.middleware.attachResponseHeader.bind(null, 'Content-Security-Policy', 'frame-ancestors \'none\''));
 
-				/* Instruct browser to deny display of <frame>, <iframe> regardless of origin.
-				 *
-				 * RFC -> https://tools.ietf.org/html/rfc7034
-				 */
-				res.setHeader('X-Frame-Options', 'DENY');
+			scope.network.app.use(httpApi.middleware.applyAPIAccessRules.bind(null, scope.config));
 
-				/* Set Content-Security-Policy headers.
-				 *
-				 * frame-ancestors - Defines valid sources for <frame>, <iframe>, <object>, <embed> or <applet>.
-				 *
-				 * W3C Candidate Recommendation -> https://www.w3.org/TR/CSP/
-				 */
-				res.setHeader('Content-Security-Policy', 'frame-ancestors \'none\'');
-
-				if (parts.length > 1) {
-					if (parts[1] === 'api') {
-						if (!checkIpInList(scope.config.api.access.whiteList, ip, true)) {
-							res.sendStatus(403);
-						} else {
-							next();
-						}
-					} else if (parts[1] === 'peer') {
-						if (checkIpInList(scope.config.peers.blackList, ip, false)) {
-							res.sendStatus(403);
-						} else {
-							next();
-						}
-					} else {
-						next();
-					}
-				} else {
-					next();
-				}
-			});
-
-			scope.network.server.listen(scope.config.port, scope.config.address, function (err) {
-				scope.logger.info('Lisk started: ' + scope.config.address + ':' + scope.config.port);
-
-				if (!err) {
-					if (scope.config.ssl.enabled) {
-						scope.network.https.listen(scope.config.ssl.options.port, scope.config.ssl.options.address, function (err) {
-							scope.logger.info('Lisk https started: ' + scope.config.ssl.options.address + ':' + scope.config.ssl.options.port);
-
-							cb(err, scope.network);
-						});
-					} else {
-						cb(null, scope.network);
-					}
-				} else {
-					cb(err, scope.network);
-				}
-			});
-
+			cb();
 		}],
 
 		ed: function (cb) {
@@ -354,6 +373,7 @@ d.run(function () {
 			var Transaction = require('./logic/transaction.js');
 			var Block = require('./logic/block.js');
 			var Account = require('./logic/account.js');
+			var Peers = require('./logic/peers.js');
 
 			async.auto({
 				bus: function (cb) {
@@ -384,7 +404,10 @@ d.run(function () {
 				}],
 				block: ['db', 'bus', 'ed', 'schema', 'genesisblock', 'account', 'transaction', function (scope, cb) {
 					new Block(scope, cb);
-				}]
+				}],
+				peers: function (cb) {
+					new Peers(scope, cb);
+				}
 			}, cb);
 		}],
 
@@ -413,9 +436,48 @@ d.run(function () {
 			});
 		}],
 
-		ready: ['modules', 'bus', function (scope, cb) {
-			scope.bus.message('bind', scope.modules);
+		api: ['modules', 'logger', 'network', function (scope, cb) {
+			Object.keys(config.api).forEach(function (moduleName) {
+				Object.keys(config.api[moduleName]).forEach(function (protocol) {
+					var apiEndpointPath = config.api[moduleName][protocol];
+					try {
+						var ApiEndpoint = require(apiEndpointPath);
+						new ApiEndpoint(scope.modules[moduleName], scope.network.app, scope.logger);
+					} catch (e) {
+						scope.logger.error('Unable to load API endpoint for ' + moduleName + ' of ' + protocol, e);
+					}
+				});
+			});
+
+			scope.network.app.use(httpApi.middleware.errorLogger.bind(null, scope.logger));
 			cb();
+		}],
+
+		ready: ['modules', 'bus', 'logic', function (scope, cb) {
+			scope.bus.message('bind', scope.modules);
+			scope.logic.transaction.bindModules(scope.modules);
+			scope.logic.peers.bind(scope);
+			cb();
+		}],
+
+		listen: ['ready', function (scope, cb) {
+			scope.network.server.listen(scope.config.port, scope.config.address, function (err) {
+				scope.logger.info('Lisk started: ' + scope.config.address + ':' + scope.config.port);
+
+				if (!err) {
+					if (scope.config.ssl.enabled) {
+						scope.network.https.listen(scope.config.ssl.options.port, scope.config.ssl.options.address, function (err) {
+							scope.logger.info('Lisk https started: ' + scope.config.ssl.options.address + ':' + scope.config.ssl.options.port);
+
+							cb(err, scope.network);
+						});
+					} else {
+						cb(null, scope.network);
+					}
+				} else {
+					cb(err, scope.network);
+				}
+			});
 		}]
 	}, function (err, scope) {
 		if (err) {

@@ -1,4 +1,4 @@
-'use strict'; /*jslint mocha:true, expr:true */
+'use strict';
 
 var async = require('async');
 var node = require('./../node.js');
@@ -61,7 +61,9 @@ function confirmTransaction (transactionId, passphrases, done) {
 				secret: passphrase,
 				transactionId: transactionId
 			}, function (err, res) {
-				node.expect(res.body).to.have.property('success').to.be.ok;
+				if (err || !res.body.success) {
+					return untilCb(err || res.body.error);
+				}
 				node.expect(res.body).to.have.property('transactionId').to.equal(transactionId);
 				count++;
 				return untilCb();
@@ -160,10 +162,10 @@ describe('PUT /api/multisignatures', function () {
 		delete validParams.keysgroup;
 
 		node.put('/api/multisignatures', validParams, function (err, res) {
-				node.expect(res.body).to.have.property('success').to.be.not.ok;
-				node.expect(res.body).to.have.property('error');
-				done();
-			});
+			node.expect(res.body).to.have.property('success').to.be.not.ok;
+			node.expect(res.body).to.have.property('error');
+			done();
+		});
 	});
 
 	it('using string keysgroup should fail', function (done) {
@@ -343,17 +345,31 @@ describe('GET /api/multisignatures/pending', function () {
 
 			var flag = 0;
 			for (var i = 0; i < res.body.transactions.length; i++) {
-				if (res.body.transactions[i].transaction.senderPublicKey === multisigAccount.publicKey) {
-					flag += 1;
-					node.expect(res.body.transactions[i].transaction).to.have.property('type').to.equal(node.txTypes.MULTI);
-					node.expect(res.body.transactions[i].transaction).to.have.property('amount').to.equal(0);
-					node.expect(res.body.transactions[i].transaction).to.have.property('asset').that.is.an('object');
-					node.expect(res.body.transactions[i].transaction).to.have.property('fee').to.equal(node.fees.multisignatureRegistrationFee * (Keys.length + 1));
-					node.expect(res.body.transactions[i].transaction).to.have.property('id').to.equal(multiSigTx.txId);
-					node.expect(res.body.transactions[i].transaction).to.have.property('senderPublicKey').to.equal(multisigAccount.publicKey);
-					node.expect(res.body.transactions[i]).to.have.property('lifetime').to.equal(multiSigTx.lifetime);
-					node.expect(res.body.transactions[i]).to.have.property('min').to.equal(multiSigTx.min);
-				}
+				flag += 1;
+
+				var pending = res.body.transactions[i];
+
+				node.expect(pending).to.have.property('max').that.is.equal(0);
+				node.expect(pending).to.have.property('min').that.is.equal(0);
+				node.expect(pending).to.have.property('lifetime').that.is.equal(0);
+				node.expect(pending).to.have.property('signed').that.is.true;
+
+				node.expect(pending.transaction).to.have.property('type').that.is.equal(node.txTypes.MULTI);
+				node.expect(pending.transaction).to.have.property('amount').that.is.equal(0);
+				node.expect(pending.transaction).to.have.property('senderPublicKey').that.is.equal(multisigAccount.publicKey);
+				node.expect(pending.transaction).to.have.property('requesterPublicKey').that.is.null;
+				node.expect(pending.transaction).to.have.property('timestamp').that.is.a('number');
+				node.expect(pending.transaction).to.have.property('asset').that.is.an('object');
+				node.expect(pending.transaction.asset).to.have.property('multisignature').that.is.an('object');
+				node.expect(pending.transaction.asset.multisignature).to.have.property('min').that.is.a('number');
+				node.expect(pending.transaction.asset.multisignature).to.have.property('keysgroup').that.is.an('array');
+				node.expect(pending.transaction.asset.multisignature).to.have.property('lifetime').that.is.a('number');
+				node.expect(pending.transaction).to.have.property('recipientId').that.is.null;
+				node.expect(pending.transaction).to.have.property('signature').that.is.a('string');
+				node.expect(pending.transaction).to.have.property('id').that.is.equal(multiSigTx.txId);
+				node.expect(pending.transaction).to.have.property('fee').that.is.equal(node.fees.multisignatureRegistrationFee * (Keys.length + 1));
+				node.expect(pending.transaction).to.have.property('senderId').that.is.eql(multisigAccount.address);
+				node.expect(pending.transaction).to.have.property('receivedAt').that.is.a('string');
 			}
 
 			node.expect(flag).to.equal(1);
@@ -362,7 +378,7 @@ describe('GET /api/multisignatures/pending', function () {
 	});
 });
 
-describe('PUT /api/api/transactions/', function () {
+describe('PUT /api/transactions', function () {
 
 	it('when group transaction is pending should be ok', function (done) {
 		sendLISKFromMultisigAccount(100000000, node.gAccount.address, function (err, transactionId) {
@@ -381,6 +397,10 @@ describe('PUT /api/api/transactions/', function () {
 describe('POST /api/multisignatures/sign (group)', function () {
 
 	var validParams;
+
+	var passphrases = accounts.map(function (account) {
+		return account.password;
+	});
 
 	beforeEach(function (done) {
 		validParams = {
@@ -418,10 +438,6 @@ describe('POST /api/multisignatures/sign (group)', function () {
 	});
 
 	it('using one less than total signatures should not confirm transaction', function (done) {
-		var passphrases = accounts.map(function (account) {
-			return account.password;
-		});
-
 		confirmTransaction(multiSigTx.txId, passphrases.slice(0, (passphrases.length - 1)), function () {
 			node.onNewBlock(function (err) {
 				node.get('/api/transactions/get?id=' + multiSigTx.txId, function (err, res) {
@@ -432,11 +448,26 @@ describe('POST /api/multisignatures/sign (group)', function () {
 		});
 	});
 
-	it('using one more signature should confirm transaction', function (done) {
-		var passphrases = accounts.map(function (account) {
-			return account.password;
+	it('using same signature again should fail', function (done) {
+		node.post('/api/multisignatures/sign', validParams, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.not.ok;
+			node.expect(res.body).to.have.property('error').to.equal('Transaction already signed');
+			done();
 		});
+	});
 
+	it('using same signature again should not confirm transaction', function (done) {
+		node.post('/api/multisignatures/sign', validParams, function (err, res) {
+			node.onNewBlock(function (err) {
+				node.get('/api/transactions/get?id=' + multiSigTx.txId, function (err, res) {
+					node.expect(res.body).to.have.property('success').to.be.not.ok;
+					done();
+				});
+			});
+		});
+	});
+
+	it('using one more signature should confirm transaction', function (done) {
 		confirmTransaction(multiSigTx.txId, passphrases.slice(-1), function () {
 			node.onNewBlock(function (err) {
 				node.get('/api/transactions/get?id=' + multiSigTx.txId, function (err, res) {
@@ -452,18 +483,30 @@ describe('POST /api/multisignatures/sign (group)', function () {
 
 describe('POST /api/multisignatures/sign (transaction)', function () {
 
+	var validParams;
+
+	var passphrases = accounts.map(function (account) {
+		return account.password;
+	});
+
 	before(function (done) {
 		sendLISKFromMultisigAccount(100000000, node.gAccount.address, function (err, transactionId) {
 			multiSigTx.txId = transactionId;
-			done();
+			node.onNewBlock(function (err) {
+				done();
+			});
 		});
 	});
 
-	it('using one less than minimum signatures should not confirm transaction', function (done) {
-		var passphrases = accounts.map(function (account) {
-			return account.password;
-		});
+	beforeEach(function (done) {
+		validParams = {
+			secret: accounts[0].password,
+			transactionId: multiSigTx.txId
+		};
+		done();
+	});
 
+	it('using one less than minimum signatures should not confirm transaction', function (done) {
 		confirmTransaction(multiSigTx.txId, passphrases.slice(0, (multiSigTx.min - 1)), function () {
 			node.onNewBlock(function (err) {
 				node.get('/api/transactions/get?id=' + multiSigTx.txId, function (err, res) {
@@ -474,11 +517,26 @@ describe('POST /api/multisignatures/sign (transaction)', function () {
 		});
 	});
 
-	it('using one more signature should confirm transaction', function (done) {
-		var passphrases = accounts.map(function (account) {
-			return account.password;
+	it('using same signature again should fail', function (done) {
+		node.post('/api/multisignatures/sign', validParams, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.not.ok;
+			node.expect(res.body).to.have.property('error').to.equal('Transaction already signed');
+			done();
 		});
+	});
 
+	it('using same signature again should not confirm transaction', function (done) {
+		node.post('/api/multisignatures/sign', validParams, function (err, res) {
+			node.onNewBlock(function (err) {
+				node.get('/api/transactions/get?id=' + multiSigTx.txId, function (err, res) {
+					node.expect(res.body).to.have.property('success').to.be.not.ok;
+					done();
+				});
+			});
+		});
+	});
+
+	it('using one more signature should confirm transaction', function (done) {
 		confirmTransaction(multiSigTx.txId, passphrases.slice(-1), function () {
 			node.onNewBlock(function (err) {
 				node.get('/api/transactions/get?id=' + multiSigTx.txId, function (err, res) {
@@ -488,6 +546,48 @@ describe('POST /api/multisignatures/sign (transaction)', function () {
 					done();
 				});
 			});
+		});
+	});
+});
+
+describe('POST /api/multisignatures/sign (regular account)', function () {
+
+	var transactionId;
+
+	before(function (done) {
+		node.put('/api/transactions/', {
+			secret: node.gAccount.password ,
+			amount: 1,
+			recipientId: accounts[0].address
+		}, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			node.expect(res.body).to.have.property('transactionId').that.is.not.empty;
+			transactionId = res.body.transactionId;
+			done();
+		});
+	});
+
+	it('should be impossible to sign the transaction', function (done) {
+		node.onNewBlock(function (err) {
+			node.get('/api/transactions/get?id=' + transactionId, function (err, res) {
+				node.expect(res.body).to.have.property('success').to.be.ok;
+				node.expect(res.body).to.have.property('transaction');
+				node.expect(res.body.transaction).to.have.property('id').to.equal(transactionId);
+				confirmTransaction(transactionId, [multisigAccount.password], function (err, res) {
+					node.expect(err).not.to.be.empty;
+					done();
+				});
+			});
+		});
+	});
+
+	it('should have no pending multisignatures', function (done) {
+		node.get('/api/multisignatures/pending?publicKey=' + accounts[0].publicKey, function (err, res) {
+			node.expect(res.body).to.have.property('success');
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			node.expect(res.body).to.have.property('transactions').that.is.an('array');
+			node.expect(res.body.transactions.length).to.equal(0);
+			done();
 		});
 	});
 });

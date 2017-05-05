@@ -1,6 +1,7 @@
-'use strict'; /*jslint mocha:true, expr:true */
+'use strict';
 
 var node = require('./../node.js');
+var transactionSortFields = require('../../sql/transactions').sortFields;
 
 var account = node.randomTxAccount();
 var account2 = node.randomTxAccount();
@@ -19,13 +20,12 @@ function putTransaction (params, done) {
 	node.put('/api/transactions', params, done);
 }
 
-function sendLISK (account, done) {
-	var randomLISK = node.randomLISK();
-	var expectedFee = node.expectedFee(randomLISK);
+function sendLISK (account, amount, done) {
+	var expectedFee = node.expectedFee(amount);
 
 	putTransaction({
 		secret: node.gAccount.password,
-		amount: randomLISK,
+		amount: amount,
 		recipientId: account.address
 	}, function (err, res) {
 		node.expect(res.body).to.have.property('success').to.be.ok;
@@ -33,9 +33,9 @@ function sendLISK (account, done) {
 		transactionList.push({
 			'sender': node.gAccount.address,
 			'recipient': account.address,
-			'grossSent': (randomLISK + expectedFee) / node.normalizer,
+			'grossSent': (amount + expectedFee) / node.normalizer,
 			'fee': expectedFee / node.normalizer,
-			'netSent': randomLISK / node.normalizer,
+			'netSent': amount / node.normalizer,
 			'txId': res.body.transactionId,
 			'type': node.txTypes.SEND
 		});
@@ -45,13 +45,27 @@ function sendLISK (account, done) {
 
 before(function (done) {
 	setTimeout(function () {
-		sendLISK(account, done);
+		sendLISK(account, node.randomLISK(), done);
 	}, 2000);
 });
 
 before(function (done) {
 	setTimeout(function () {
-		sendLISK(account2, done);
+		sendLISK(account2, node.randomLISK(), done);
+	}, 2000);
+});
+
+before(function (done) {
+	setTimeout(function () {
+		// Send 20 LSK
+		sendLISK(account2, 20*100000000, done);
+	}, 2000);
+});
+
+before(function (done) {
+	setTimeout(function () {
+		// Send 100 LSK
+		sendLISK(account2, 100*100000000, done);
 	}, 2000);
 });
 
@@ -94,6 +108,180 @@ describe('GET /api/transactions', function () {
 		});
 	});
 
+	it('using valid parameters with and/or should be ok', function (done) {
+		var limit = 10;
+		var offset = 0;
+		var orderBy = 'amount:asc';
+
+		var params = [
+			'and:blockId=' + '1',
+			'or:senderId=' + node.gAccount.address,
+			'or:recipientId=' + account.address,
+			'limit=' + limit,
+			'offset=' + offset,
+			'orderBy=' + orderBy
+		];
+
+		node.get('/api/transactions?' + params.join('&'), function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			node.expect(res.body).to.have.property('transactions').that.is.an('array');
+			node.expect(res.body.transactions).to.have.length.within(transactionList.length, limit);
+			for (var i = 0; i < res.body.transactions.length; i++) {
+				if (res.body.transactions[i + 1]) {
+					node.expect(res.body.transactions[i].amount).to.be.at.most(res.body.transactions[i + 1].amount);
+				}
+			}
+			done();
+		});
+	});
+
+	it('using minAmount with and:maxAmount ordered by amount and limited should be ok', function (done) {
+		var limit = 10;
+		var offset = 0;
+		var orderBy = 'amount:asc';
+		var minAmount = 20*100000000; // 20 LSK
+		var maxAmount = 100*100000000; // 100 LSK
+
+		var params = [
+			'minAmount=' + minAmount,
+			'and:maxAmount=' + maxAmount,
+			'limit=' + limit,
+			'offset=' + offset,
+			'orderBy=' + orderBy
+		];
+
+		node.get('/api/transactions?' + params.join('&'), function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			node.expect(res.body).to.have.property('transactions').that.is.an('array');
+			node.expect(res.body.transactions).to.have.length.within(2, limit);
+			node.expect(res.body.transactions[0].amount).to.be.equal(minAmount);
+			node.expect(res.body.transactions[res.body.transactions.length-1].amount).to.be.equal(maxAmount);
+			for (var i = 0; i < res.body.transactions.length; i++) {
+				if (res.body.transactions[i + 1]) {
+					node.expect(res.body.transactions[i].amount).to.be.at.most(res.body.transactions[i + 1].amount);
+				}
+			}
+			done();
+		});
+	});
+
+	it('using valid parameters with/without and/or should be ok', function (done) {
+		var limit = 10;
+		var offset = 0;
+		var orderBy = 'amount:asc';
+
+		var params = [
+			'and:blockId=' + '1',
+			'or:senderId=' + node.gAccount.address,
+			'or:recipientId=' + account.address,
+			'fromHeight=' + 1,
+			'toHeight=' + 666,
+			'and:fromTimestamp=' + 0,
+			'and:minAmount=' + 0,
+			'limit=' + limit,
+			'offset=' + offset,
+			'orderBy=' + orderBy
+		];
+
+		node.get('/api/transactions?' + params.join('&'), function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			node.expect(res.body).to.have.property('transactions').that.is.an('array');
+			node.expect(res.body.transactions).to.have.length.within(transactionList.length, limit);
+			for (var i = 0; i < res.body.transactions.length; i++) {
+				if (res.body.transactions[i + 1]) {
+					node.expect(res.body.transactions[i].amount).to.be.at.most(res.body.transactions[i + 1].amount);
+				}
+			}
+			done();
+		});
+	});
+
+	it('using valid array-like parameters should be ok', function (done) {
+		var limit = 10;
+		var offset = 0;
+		var orderBy = 'amount:asc';
+
+		var params = [
+			'blockId=' + '1',
+			'or:senderIds=' + node.gAccount.address + ',' + account.address,
+			'or:recipientIds=' + account.address + ',' + account2.address,
+			'or:senderPublicKeys=' + node.gAccount.publicKey,
+			'or:recipientPublicKeys=' + node.gAccount.publicKey + ',' + account.publicKey,
+			'limit=' + limit,
+			'offset=' + offset,
+			'orderBy=' + orderBy
+		];
+
+		node.get('/api/transactions?' + params.join('&'), function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			node.expect(res.body).to.have.property('transactions').that.is.an('array');
+			node.expect(res.body.transactions).to.have.length.within(transactionList.length, limit);
+			for (var i = 0; i < res.body.transactions.length; i++) {
+				if (res.body.transactions[i + 1]) {
+					node.expect(res.body.transactions[i].amount).to.be.at.most(res.body.transactions[i + 1].amount);
+				}
+			}
+			done();
+		});
+	});
+
+	it('using one invalid field name with and/or should fail', function (done) {
+		var limit = 10;
+		var offset = 0;
+		var orderBy = 'amount:asc';
+
+		var params = [
+			'and:blockId=' + '1',
+			'or:senderId=' + node.gAccount.address,
+			'or:whatever=' + account.address,
+			'limit=' + limit,
+			'offset=' + offset,
+			'orderBy=' + orderBy
+		];
+
+		node.get('/api/transactions?' + params.join('&'), function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.not.ok;
+			node.expect(res.body).to.have.property('error');
+			done();
+		});
+	});
+
+	it('using invalid condition should fail', function (done) {
+		var params = [
+			'whatever:senderId=' + node.gAccount.address
+		];
+
+		node.get('/api/transactions?' + params.join('&'), function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.not.ok;
+			node.expect(res.body).to.have.property('error');
+			done();
+		});
+	});
+
+	it('using invalid field name (x:y:z) should fail', function (done) {
+		var params = [
+			'or:whatever:senderId=' + node.gAccount.address
+		];
+
+		node.get('/api/transactions?' + params.join('&'), function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.not.ok;
+			node.expect(res.body).to.have.property('error');
+			done();
+		});
+	});
+
+	it('using empty parameter should fail', function (done) {
+		var params = [
+			'and:publicKey='
+		];
+
+		node.get('/api/transactions?' + params.join('&'), function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.not.ok;
+			node.expect(res.body).to.have.property('error');
+			done();
+		});
+	});
+
 	it('using type should be ok', function (done) {
 		var type = node.txTypes.SEND;
 		var params = 'type=' + type;
@@ -123,8 +311,28 @@ describe('GET /api/transactions', function () {
 		});
 	});
 
-	it('using limit > 100 should fail', function (done) {
-		var limit = 101;
+	it('using too small fromUnixTime should fail', function (done) {
+		var params = 'fromUnixTime=1464109199';
+
+		node.get('/api/transactions?' + params, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.not.ok;
+			node.expect(res.body).to.have.property('error');
+			done();
+		});
+	});
+
+	it('using too small toUnixTime should fail', function (done) {
+		var params = 'toUnixTime=1464109200';
+
+		node.get('/api/transactions?' + params, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.not.ok;
+			node.expect(res.body).to.have.property('error');
+			done();
+		});
+	});
+
+	it('using limit > 1000 should fail', function (done) {
+		var limit = 1001;
 		var params = 'limit=' + limit;
 
 		node.get('/api/transactions?' + params, function (err, res) {
@@ -215,6 +423,32 @@ describe('GET /api/transactions', function () {
 			done();
 		});
 	});
+
+	it('using orderBy with any of sort fields should not place NULLs first', function (done) {
+		node.async.each(transactionSortFields, function (sortField, cb) {
+			node.get('/api/transactions?orderBy=' + sortField, function (err, res) {
+				node.expect(res.body).to.have.property('success').to.be.ok;
+				node.expect(res.body).to.have.property('transactions').that.is.an('array');
+
+				var dividedIndices = res.body.transactions.reduce(function (memo, peer, index) {
+					memo[peer[sortField] === null ? 'nullIndices' : 'notNullIndices'].push(index);
+					return memo;
+				}, {notNullIndices: [], nullIndices: []});
+
+				if (dividedIndices.nullIndices.length && dividedIndices.notNullIndices.length) {
+					var ascOrder = function (a, b) { return a - b; };
+					dividedIndices.notNullIndices.sort(ascOrder);
+					dividedIndices.nullIndices.sort(ascOrder);
+
+					node.expect(dividedIndices.notNullIndices[dividedIndices.notNullIndices.length - 1])
+						.to.be.at.most(dividedIndices.nullIndices[0]);
+				}
+				cb();
+			});
+		}, function () {
+			done();
+		});
+	});
 });
 
 describe('GET /api/transactions/get?id=', function () {
@@ -247,6 +481,70 @@ describe('GET /api/transactions/get?id=', function () {
 	});
 });
 
+describe('GET /api/transactions/count', function () {
+
+	it('should be ok', function (done) {
+		node.get('/api/transactions/count', function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			node.expect(res.body).to.have.property('confirmed').that.is.an('number');
+			node.expect(res.body).to.have.property('queued').that.is.an('number');
+			node.expect(res.body).to.have.property('multisignature').that.is.an('number');
+			node.expect(res.body).to.have.property('unconfirmed').that.is.an('number');
+			done();
+		});
+	});
+});
+
+describe('GET /api/transactions/queued/get?id=', function () {
+
+	it('using unknown id should be ok', function (done) {
+		var params = 'id=' + '1234';
+
+		node.get('/api/transactions/queued/get?' + params, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.false;
+			node.expect(res.body).to.have.property('error').that.is.equal('Transaction not found');
+			done();
+		});
+	});
+});
+
+describe('GET /api/transactions/queued', function () {
+
+	it('should be ok', function (done) {
+		node.get('/api/transactions/queued', function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			node.expect(res.body).to.have.property('transactions').that.is.an('array');
+			node.expect(res.body).to.have.property('count').that.is.an('number');
+			done();
+		});
+	});
+});
+
+describe('GET /api/transactions/multisignatures/get?id=', function () {
+
+	it('using unknown id should be ok', function (done) {
+		var params = 'id=' + '1234';
+
+		node.get('/api/transactions/multisignatures/get?' + params, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.false;
+			node.expect(res.body).to.have.property('error').that.is.equal('Transaction not found');
+			done();
+		});
+	});
+});
+
+describe('GET /api/transactions/multisignatures', function () {
+
+	it('should be ok', function (done) {
+		node.get('/api/transactions/multisignatures', function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			node.expect(res.body).to.have.property('transactions').that.is.an('array');
+			node.expect(res.body).to.have.property('count').that.is.an('number');
+			done();
+		});
+	});
+});
+
 describe('GET /api/transactions/unconfirmed/get?id=', function () {
 
 	it('using valid id should be ok', function (done) {
@@ -271,6 +569,7 @@ describe('GET /api/transactions/unconfirmed', function () {
 		node.get('/api/transactions/unconfirmed', function (err, res) {
 			node.expect(res.body).to.have.property('success').to.be.ok;
 			node.expect(res.body).to.have.property('transactions').that.is.an('array');
+			node.expect(res.body).to.have.property('count').that.is.an('number');
 			done();
 		});
 	});

@@ -10,9 +10,10 @@ var sandboxHelper = require('../helpers/sandbox.js');
 var modules, library, self, __private = {}, shared = {};
 
 __private.loaded = false;
-__private.DOUBLE_DOUBLE_QUOTES = /''/g;
 __private.SINGLE_QUOTES = /'/g;
 __private.SINGLE_QUOTES_DOUBLED = '\'\'';
+__private.DOUBLE_QUOTES = /"/g;
+__private.DOUBLE_QUOTES_DOUBLED = '""';
 
 // Constructor
 function Sql (cb, scope) {
@@ -22,29 +23,34 @@ function Sql (cb, scope) {
 	setImmediate(cb, null, self);
 }
 
+// Private methods
 __private.escape = function (what) {
 	switch (typeof what) {
-		case 'string':
-			return '\'' + what.replace(
+	case 'string':
+		return '\'' + what.replace(
 				__private.SINGLE_QUOTES, __private.SINGLE_QUOTES_DOUBLED
 			) + '\'';
-		case 'object':
-			if (what == null) {
-				return 'null';
-			} else if (Buffer.isBuffer(what)) {
-				return 'X\'' + what.toString('hex') + '\'';
-			} else {
-				return ('\'' + JSON.stringify(what).replace(
+	case 'object':
+		if (what == null) {
+			return 'null';
+		} else if (Buffer.isBuffer(what)) {
+			return 'X\'' + what.toString('hex') + '\'';
+		} else {
+			return ('\'' + JSON.stringify(what).replace(
 					__private.SINGLE_QUOTES, __private.SINGLE_QUOTES_DOUBLED
 				) + '\'');
-			}
-			break;
-		case 'boolean':
-			return what ? '1' : '0'; // 1 => true, 0 => false
-		case 'number':
-			if (isFinite(what)) { return '' + what; }
+		}
+		break;
+	case 'boolean':
+		return what ? '1' : '0'; // 1 => true, 0 => false
+	case 'number':
+		if (isFinite(what)) { return '' + what; }
 	}
 	throw 'Unsupported data ' + typeof what;
+};
+
+__private.escape2 = function (str) {
+	return '"' + str.replace(__private.DOUBLE_QUOTES, __private.DOUBLE_QUOTES_DOUBLED) + '"';
 };
 
 __private.pass = function (obj, dappid) {
@@ -79,7 +85,6 @@ __private.pass = function (obj, dappid) {
 	}
 };
 
-// Private methods
 __private.query = function (action, config, cb) {
 	var sql = null;
 
@@ -100,6 +105,7 @@ __private.query = function (action, config, cb) {
 
 		try {
 			sql = jsonSql.build(extend({}, config, defaultConfig));
+			library.logger.trace('sql.query:', sql);
 		} catch (e) {
 			return done(e);
 		}
@@ -119,27 +125,27 @@ __private.query = function (action, config, cb) {
 				batchPack = config.values.splice(0, 10);
 				return batchPack.length === 0;
 			}, function (cb) {
-				var fields = Object.keys(config.fields).map(function (field) {
-					return __private.escape(config.fields[field]);
-				});
-				sql = 'INSERT INTO ' + 'dapp_' + config.dappid + '_' + config.table + ' (' + fields.join(',') + ') ';
-				var rows = [];
-				batchPack.forEach(function (value, rowIndex) {
-					var currentRow = batchPack[rowIndex];
-					var fields = [];
-					for (var i = 0; i < currentRow.length; i++) {
-						fields.push(__private.escape(currentRow[i]));
-					}
-					rows.push('SELECT ' + fields.join(','));
-				});
-				sql = sql + ' ' + rows.join(' UNION ');
-				library.db.none(sql).then(function () {
-					return setImmediate(cb);
-				}).catch(function (err) {
-					library.logger.error(err.stack);
-					return setImmediate(cb, 'Sql#query error');
-				});
-			}, done);
+			var fields = Object.keys(config.fields).map(function (field) {
+				return __private.escape2(config.fields[field]);	// Add double quotes to field identifiers
+			});
+			sql = 'INSERT INTO ' + 'dapp_' + config.dappid + '_' + config.table + ' (' + fields.join(',') + ') ';
+			var rows = [];
+			batchPack.forEach(function (value, rowIndex) {
+				var currentRow = batchPack[rowIndex];
+				var fields = [];
+				for (var i = 0; i < currentRow.length; i++) {
+					fields.push(__private.escape(currentRow[i]));
+				}
+				rows.push('SELECT ' + fields.join(','));
+			});
+			sql = sql + ' ' + rows.join(' UNION ');
+			library.db.none(sql).then(function () {
+				return setImmediate(cb);
+			}).catch(function (err) {
+				library.logger.error(err.stack);
+				return setImmediate(cb, 'Sql#query error');
+			});
+		}, done);
 	}
 };
 
@@ -224,7 +230,7 @@ Sql.prototype.onBlockchainReady = function () {
 	__private.loaded = true;
 };
 
-// Shared
+// Shared API
 shared.select = function (req, cb) {
 	var config = extend({}, req.body, {dappid: req.dappid});
 	__private.query.call(this, 'select', config, cb);

@@ -23,7 +23,7 @@ function Migrator (pgp, db) {
 		}
 		db.query('SELECT * FROM migrations ORDER BY "id" DESC LIMIT 1').then(function (rows) {
 			if (rows[0]) {
-				rows[0].id = bignum(rows[0].id);
+				rows[0].id = new bignum(rows[0].id);
 			}
 			return waterCb(null, rows[0]);
 		}).catch(function (err) {
@@ -32,7 +32,7 @@ function Migrator (pgp, db) {
 	};
 
 	this.readPendingMigrations = function (lastMigration, waterCb) {
-		var migrationsPath = path.join('sql', 'migrations');
+		var migrationsPath = path.join(process.cwd(), 'sql', 'migrations');
 		var pendingMigrations = [];
 
 		function matchMigrationName (file) {
@@ -44,7 +44,7 @@ function Migrator (pgp, db) {
 		function matchMigrationId (file) {
 			var id = file.match(/^[0-9]+/);
 
-			return Array.isArray(id) ? bignum(id[0]): null;
+			return Array.isArray(id) ? new bignum(id[0]) : null;
 		}
 
 		fs.readdir(migrationsPath, function (err, files) {
@@ -102,7 +102,8 @@ function Migrator (pgp, db) {
 	};
 
 	this.applyRuntimeQueryFile = function (waterCb) {
-		var sql = new pgp.QueryFile(path.join('sql', 'runtime.sql'), {minify: true});
+		var dirname = path.basename(__dirname) === 'helpers' ? path.join(__dirname, '..') : __dirname;
+		var sql = new pgp.QueryFile(path.join(dirname, 'sql', 'runtime.sql'), {minify: true});
 
 		db.query(sql).then(function () {
 			return waterCb();
@@ -123,7 +124,7 @@ module.exports.connect = function (config, logger, cb) {
 	monitor.attach(pgOptions, config.logEvents);
 	monitor.setTheme('matrix');
 
-	monitor.log = function(msg, info){
+	monitor.log = function (msg, info){
 		logger.log(info.event, info.text);
 		info.display = false;
 	};

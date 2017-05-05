@@ -1,6 +1,7 @@
-'use strict'; /*jslint mocha:true, expr:true */
+'use strict';
 
 var node = require('./../node.js');
+var peersSortFields = require('../../sql/peers').sortFields;
 
 describe('GET /api/peers/version', function () {
 
@@ -8,8 +9,22 @@ describe('GET /api/peers/version', function () {
 		node.get('/api/peers/version', function (err, res) {
 			node.expect(res.body).to.have.property('success').to.be.ok;
 			node.expect(res.body).to.have.property('build').to.be.a('string');
+			node.expect(res.body).to.have.property('commit').to.be.a('string');
 			node.expect(res.body).to.have.property('version').to.be.a('string');
 			done();
+		});
+	});
+});
+
+describe('GET /api/peers/count', function () {
+
+	it('should be ok', function (done) {
+		node.get('/api/peers/count', function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			node.expect(res.body).to.have.property('connected').that.is.a('number');
+			node.expect(res.body).to.have.property('disconnected').that.is.a('number');
+			node.expect(res.body).to.have.property('banned').that.is.a('number');
+			done ();
 		});
 	});
 });
@@ -159,6 +174,77 @@ describe('GET /api/peers', function () {
 		});
 	});
 
+	it('using os == "freebsd10" should be ok', function (done) {
+		var os = 'freebsd10';
+		var params = 'os=' + os;
+
+		node.get('/api/peers?' + params, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			done();
+		});
+	});
+
+	it('using os == "freebsd10.3" should be ok', function (done) {
+		var os = 'freebsd10.3';
+		var params = 'os=' + os;
+
+		node.get('/api/peers?' + params, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			done();
+		});
+	});
+
+	it('using os == "freebsd10.3-" should be ok', function (done) {
+		var os = 'freebsd10.3-';
+		var params = 'os=' + os;
+
+		node.get('/api/peers?' + params, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			done();
+		});
+	});
+
+	it('using os == "freebsd10.3_" should be ok', function (done) {
+		var os = 'freebsd10.3_';
+		var params = 'os=' + os;
+
+		node.get('/api/peers?' + params, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			done();
+		});
+	});
+
+	it('using os == "freebsd10.3_RELEASE" should be ok', function (done) {
+		var os = 'freebsd10.3_RELEASE';
+		var params = 'os=' + os;
+
+		node.get('/api/peers?' + params, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			done();
+		});
+	});
+
+	it('using os == "freebsd10.3_RELEASE-p7" should be ok', function (done) {
+		var os = 'freebsd10.3_RELEASE-p7';
+		var params = 'os=' + os;
+
+		node.get('/api/peers?' + params, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			done();
+		});
+	});
+
+	it('using os == "freebsd10.3_RELEASE-p7-@" should fail', function (done) {
+		var os = 'freebsd10.3_RELEASE-p7-@';
+		var params = 'os=' + os;
+
+		node.get('/api/peers?' + params, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.not.ok;
+			node.expect(res.body).to.have.property('error').to.equal('Object didn\'t pass validation for format os: freebsd10.3_RELEASE-p7-@');
+			done();
+		});
+	});
+
 	it('using version == "999.999.999" characters should be ok', function (done) {
 		var version = '999.999.999';
 		var params = 'version=' + version;
@@ -223,6 +309,27 @@ describe('GET /api/peers', function () {
 		});
 	});
 
+	it('using invalid broadhash should fail', function (done) {
+		var broadhash = 'invalid';
+		var params = 'broadhash=' + broadhash;
+
+		node.get('/api/peers?' + params, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.not.ok;
+			node.expect(res.body).to.have.property('error').to.equal('Object didn\'t pass validation for format hex: invalid');
+			done();
+		});
+	});
+
+	it('using valid broadhash should be ok', function (done) {
+		var broadhash = node.config.nethash;
+		var params = 'broadhash=' + broadhash;
+
+		node.get('/api/peers?' + params, function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.ok;
+			done();
+		});
+	});
+
 	it('using orderBy == "state:desc" should be ok', function (done) {
 		var orderBy = 'state:desc';
 		var params = 'orderBy=' + orderBy;
@@ -241,6 +348,32 @@ describe('GET /api/peers', function () {
 
 			done();
 		});
+	});
+
+	it('using orderBy with any of sort fields should not place NULLs first', function (done) {
+	    node.async.each(peersSortFields, function (sortField, cb) {
+		    node.get('/api/peers?orderBy=' + sortField, function (err, res) {
+			    node.expect(res.body).to.have.property('success').to.be.ok;
+			    node.expect(res.body).to.have.property('peers').that.is.an('array');
+
+			    var dividedIndices = res.body.peers.reduce(function (memo, peer, index) {
+				    memo[peer[sortField] === null ? 'nullIndices' : 'notNullIndices'].push(index);
+				    return memo;
+			    }, {notNullIndices: [], nullIndices: []});
+
+			    if (dividedIndices.nullIndices.length && dividedIndices.notNullIndices.length) {
+				    var ascOrder = function (a, b) { return a - b; };
+				    dividedIndices.notNullIndices.sort(ascOrder);
+				    dividedIndices.nullIndices.sort(ascOrder);
+
+				    node.expect(dividedIndices.notNullIndices[dividedIndices.notNullIndices.length - 1])
+					    .to.be.at.most(dividedIndices.nullIndices[0]);
+			    }
+			    cb();
+		    });
+	    }, function () {
+		    done();
+	    });
 	});
 
 	it('using string limit should fail', function (done) {
@@ -349,7 +482,7 @@ describe('GET /api/peers/get', function () {
 	var validParams;
 
 	before(function (done) {
-		node.addPeers(1, function (err, headers) {
+		node.addPeers(1, '0.0.0.0', function (err, headers) {
 			validParams = headers;
 			done();
 		});
@@ -383,6 +516,17 @@ describe('GET /api/peers/get', function () {
 		node.get('/api/peers/get?ip=0.0.0.0&port=' + validParams.port, function (err, res) {
 			node.expect(res.body).to.have.property('success').to.be.not.ok;
 			node.expect(res.body).to.have.property('error').to.equal('Peer not found');
+			done();
+		});
+	});
+});
+
+describe('GET /api/peers/unknown', function () {
+
+	it('should not to do anything', function (done) {
+		node.get('/api/peers/unknown', function (err, res) {
+			node.expect(res.body).to.have.property('success').to.be.not.ok;
+			node.expect(res.body).to.have.property('error').to.equal('API endpoint not found');
 			done();
 		});
 	});
