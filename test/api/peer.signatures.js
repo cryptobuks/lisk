@@ -174,7 +174,7 @@ describe('POST /peer/signatures', function () {
 
 			postSignature(transaction, signature, function (err, res) {
 				node.expect(res.body).to.have.property('success').to.be.not.ok;
-				node.expect(res.body).to.have.property('message').to.equal('Error processing signature: Failed to verify signature');
+				node.expect(res.body).to.have.property('message').to.equal('Invalid signature body');
 				done();
 			});
 		});
